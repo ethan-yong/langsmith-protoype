@@ -1,0 +1,96 @@
+# RAG System for Sentiment Analysis Research Papers
+# Python 3.9+ recommended
+
+# ============================================================================
+# Core Dependencies
+# ============================================================================
+
+# LangChain - RAG framework
+langchain==0.3.0
+langchain-community==0.3.0
+
+# Vector Store
+faiss-cpu==1.13.2  # Use faiss-gpu if you have GPU with CUDA
+# chromadb==0.4.22  # Alternative vector store (uncomment if preferred)
+
+# PDF Processing
+PyPDF2>=3.0.0
+pdf2image>=1.16.0
+
+# OCR Dependencies
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# Note: You also need to install Tesseract OCR separately:
+# - Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
+# - Mac: brew install tesseract
+# - Linux: sudo apt-get install tesseract-ocr
+
+# ============================================================================
+# ML/AI Dependencies
+# ============================================================================
+
+# Hugging Face Transformers
+transformers>=4.40.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0  # For 4-bit quantization (requires CUDA)
+sentencepiece>=0.2.0  # For LLaMA tokenizer
+protobuf>=3.20.0
+
+# PyTorch (choose appropriate version for your system)
+torch>=2.1.0  # CPU version
+# For GPU: pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+# Sentence Transformers for embeddings
+sentence-transformers>=2.5.0
+
+# ============================================================================
+# Optional: Opik Tracing (for observability and experiment tracking)
+# ============================================================================
+opik>=0.1.0
+# Set OPIK_API_KEY environment variable to enable
+# Get your API key from: https://www.comet.com/opik
+
+# ============================================================================
+# Utilities
+# ============================================================================
+python-dotenv>=1.0.0  # For environment variable management
+tqdm>=4.66.0  # Progress bars
+
+# ============================================================================
+# Installation Instructions
+# ============================================================================
+#
+# 1. Create a virtual environment (recommended):
+#    python -m venv venv
+#    
+#    Activate it:
+#    - Windows: venv\Scripts\activate
+#    - Mac/Linux: source venv/bin/activate
+#
+# 2. Install dependencies:
+#    pip install -r requirements.txt
+#
+# 3. Install Tesseract OCR (for scanned PDFs):
+#    - Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#    - Mac: brew install tesseract
+#    - Linux: sudo apt-get install tesseract-ocr
+#
+# 4. Install poppler (required for pdf2image):
+#    - Windows: Download from https://github.com/oschwartz10612/poppler-windows/releases/
+#              Add to PATH or set poppler_path in code
+#    - Mac: brew install poppler
+#    - Linux: sudo apt-get install poppler-utils
+#
+# 5. For GPU acceleration (optional but recommended):
+#    - Install CUDA Toolkit: https://developer.nvidia.com/cuda-downloads
+#    - Reinstall PyTorch with CUDA:
+#      pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+#
+# 6. Hugging Face Model Access:
+#    - Create account at https://huggingface.co/
+#    - For LLaMA models, request access at: https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
+#    - Login via CLI: huggingface-cli login
+#    - Enter your access token when prompted
+#
+# ============================================================================
