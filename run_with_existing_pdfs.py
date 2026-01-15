@@ -8,6 +8,10 @@ Simply run this to start using the RAG system immediately!
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Update the main script to use the documents folder
 PDF_DIRECTORY = "./documents"
@@ -53,50 +57,68 @@ def main():
     opik_client = setup_opik_tracing()
     
     # ========================================================================
-    # STEP 1: Extract text from PDFs
+    # STEP 1: Check if vector store already exists
     # ========================================================================
-    processor = PDFProcessor(ocr_enabled=True)
-    pdf_paths = [str(p) for p in pdf_files]
-    documents = processor.process_multiple_pdfs(pdf_paths)
-    
-    if not documents:
-        print("\n❌ No documents extracted. Exiting.")
-        return
-    
-    # ========================================================================
-    # STEP 2: Create embeddings and vector store
-    # ========================================================================
-    embedding_manager = EmbeddingManager()
-    
-    # Check if vector store already exists
     VECTOR_STORE_PATH = "./faiss_index"
+    embedding_manager = EmbeddingManager()
     vectorstore = embedding_manager.load_vector_store(VECTOR_STORE_PATH)
     
-    if vectorstore is None:
-        # Create new vector store
+    if vectorstore is not None:
+        # Vector store exists - skip PDF processing!
+        print("\n✅ Using existing vector store (skipping PDF processing)")
+        print("   To rebuild from PDFs, delete the ./faiss_index folder")
+    else:
+        # Vector store doesn't exist - process PDFs
+        print("\n📄 No existing vector store found - processing PDFs...")
+        
+        # ====================================================================
+        # STEP 2: Extract text from PDFs (only if needed)
+        # ====================================================================
+        processor = PDFProcessor(ocr_enabled=True)
+        pdf_paths = [str(p) for p in pdf_files]
+        documents = processor.process_multiple_pdfs(pdf_paths)
+        
+        if not documents:
+            print("\n❌ No documents extracted. Exiting.")
+            return
+        
+        # ====================================================================
+        # STEP 3: Create embeddings and vector store
+        # ====================================================================
         chunks = embedding_manager.chunk_documents(documents)
         vectorstore = embedding_manager.create_vector_store(chunks, VECTOR_STORE_PATH)
-    else:
-        print("   (Using existing vector store. Delete ./faiss_index to rebuild)")
     
     # ========================================================================
-    # STEP 3: Initialize LLaMA QA Agent
+    # STEP 4: Initialize LLaMA QA Agent
     # ========================================================================
     print("\n⚠️  Loading LLaMA model - This may take 2-5 minutes...")
     print("   (First time: ~16GB download + loading time)")
     print("   (Subsequent times: ~2 minutes)")
     
+    # Check if using remote API
+    use_remote = os.getenv("USE_REMOTE_LLM", "false").lower() == "true"
+    api_base = os.getenv("OPENAI_API_BASE")
+    model_name = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+    
+    # Debug output
+    print(f"\n🔍 DEBUG: Environment Variables:")
+    print(f"   USE_REMOTE_LLM: {os.getenv('USE_REMOTE_LLM')} -> use_remote={use_remote}")
+    print(f"   OPENAI_API_BASE: {api_base}")
+    print(f"   LLM_MODEL: {model_name}")
+    
     qa_agent = LLaMAQAAgent(
-        model_name="meta-llama/Llama-3.1-8B-Instruct",
-        use_4bit=True,  # Use 4-bit quantization to reduce memory usage
-        opik_client=opik_client  # Pass Opik client for logging
+        model_name=model_name,
+        use_4bit=True,  # Use 4-bit quantization (for local models only)
+        opik_client=opik_client,  # Pass Opik client for logging
+        use_remote=use_remote,
+        api_base=api_base
     )
     
     # Create QA chain
     qa_chain = qa_agent.create_qa_chain(vectorstore)
     
     # ========================================================================
-    # STEP 4: Interactive QA Loop
+    # STEP 5: Interactive QA Loop
     # ========================================================================
     print("\n" + "="*60)
     print("💬 INTERACTIVE QA MODE")

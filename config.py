@@ -30,6 +30,11 @@ class Config:
     # LLM Model (for answer generation)
     LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
     
+    # Remote LLM Configuration (for VM/API endpoints)
+    USE_REMOTE_LLM = os.getenv("USE_REMOTE_LLM", "false").lower() == "true"
+    OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", None)
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "not-needed")
+    
     # Alternative models you can try:
     # - "meta-llama/Llama-2-7b-chat-hf"
     # - "meta-llama/Llama-2-13b-chat-hf"

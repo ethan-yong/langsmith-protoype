@@ -47,12 +47,24 @@ from transformers import (
 
 # Opik tracing (optional)
 try:
-    from opik import Opik
-    from opik.decorators import track
+    from opik import Opik, configure, opik_context, track
     OPIK_AVAILABLE = True
 except ImportError:
     OPIK_AVAILABLE = False
     print("⚠️  Opik not available. Install with: pip install opik")
+    # Create dummy decorator when Opik is not available
+    def track(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator if not args else decorator(args[0])
+
+# Ollama integration
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+    print("⚠️  Ollama library not available. Install with: pip install ollama")
 
 
 class PDFProcessor:
@@ -315,71 +327,196 @@ class EmbeddingManager:
 class LLaMAQAAgent:
     """
     Manages the LLaMA model and conversational QA chain.
+    Supports both local models and remote OpenAI-compatible APIs.
     """
     
     def __init__(
         self,
         model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
         use_4bit: bool = True,
-        opik_client=None
+        opik_client=None,
+        use_remote: bool = False,
+        api_base: str = None
     ):
         """
-        Initialize the QA agent with LLaMA model.
+        Initialize the QA agent with LLaMA model or remote API.
         
         Args:
-            model_name: HuggingFace model name
-            use_4bit: Whether to use 4-bit quantization (reduces memory usage)
+            model_name: HuggingFace model name or remote model name
+            use_4bit: Whether to use 4-bit quantization (local only)
             opik_client: Optional Opik client for logging
+            use_remote: Use remote OpenAI-compatible API instead of local model
+            api_base: Base URL for remote API (e.g., http://192.168.2.134:31180)
         """
+        self.model_name = model_name
+        self.opik_client = opik_client
+        self.use_remote = use_remote
+        
+        if use_remote:
+            # Use OpenAI-compatible API (Ollama) with Opik tracking
+            print(f"\n🌐 Connecting to remote LLM (OpenAI-compatible): {api_base}")
+            print(f"   Model: {model_name}")
+            
+            import requests
+            from langchain.llms.base import LLM
+            from typing import Optional, List, Any
+            
+            # Get API key from environment
+            api_key = os.getenv("OPENAI_API_KEY", "not-needed")
+            
+            # Clean base URL
+            clean_base = api_base.rstrip('/').replace('/chat/completions', '').replace('/v1', '')
+            
+            # OpenAI-compatible LLM with Opik tracking
+            class OpenAICompatibleLLM(LLM):
+                api_base: str
+                api_key: str
+                model: str
+                temperature: float = 0.7
+                max_tokens: int = 512
+                opik_enabled: bool = OPIK_AVAILABLE
+                
+                @property
+                def _llm_type(self) -> str:
+                    return "openai_compatible"
+                
+                @track(
+                    name="llm_call", 
+                    tags=["ollama", "openai_compatible", "rag"],
+                    project_name="sentiment-analysis-rag"
+                )
+                def _call(
+                    self,
+                    prompt: str,
+                    stop: Optional[List[str]] = None,
+                    run_manager: Optional[Any] = None,
+                    **kwargs: Any,
+                ) -> str:
+                    """Call OpenAI-compatible API with Opik tracking"""
+                    try:
+                        # Make direct API call
+                        headers = {
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json"
+                        }
+                        
+                        payload = {
+                            "model": self.model,
+                            "messages": [
+                                {"role": "user", "content": prompt}
+                            ],
+                            "temperature": self.temperature,
+                            "max_tokens": self.max_tokens
+                        }
+                        
+                        response = requests.post(
+                            f"{self.api_base}/v1/chat/completions",
+                            headers=headers,
+                            json=payload,
+                            timeout=60
+                        )
+                        
+                        response.raise_for_status()
+                        result = response.json()
+                        
+                        # Update Opik context with metadata if available
+                        if self.opik_enabled:
+                            try:
+                                usage = result.get('usage', {})
+                                opik_context.update_current_span(
+                                    metadata={
+                                        "model": result.get('model', self.model),
+                                        "api_base": self.api_base,
+                                        "finish_reason": result.get('choices', [{}])[0].get('finish_reason'),
+                                    },
+                                    usage={
+                                        "completion_tokens": usage.get('completion_tokens', 0),
+                                        "prompt_tokens": usage.get('prompt_tokens', 0),
+                                        "total_tokens": usage.get('total_tokens', 0),
+                                    },
+                                )
+                            except Exception as e:
+                                print(f"⚠️  Opik tracking warning: {e}")
+                        
+                        # Extract content
+                        if 'choices' in result and len(result['choices']) > 0:
+                            content = result['choices'][0]['message']['content']
+                            print(f"✅ LLM response received ({len(content)} chars)")
+                            return content
+                        else:
+                            print(f"⚠️  Unexpected response format: {result}")
+                            return "ERROR: No choices in response"
+                            
+                    except Exception as e:
+                        print(f"\n❌ API Error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return f"ERROR: {str(e)}"
+            
+            # Initialize LLM
+            self.llm = OpenAICompatibleLLM(
+                api_base=clean_base,
+                api_key=api_key,
+                model=model_name,
+                temperature=0.7,
+                max_tokens=512
+            )
+            
+            self.device = "remote"
+            print(f"✅ Connected to remote LLM at {clean_base}/v1/chat/completions")
+            print(f"✅ Opik tracking: {'enabled' if OPIK_AVAILABLE else 'disabled'}")
+            return
+        
+        # Local model loading (original code)
         print(f"\n🦙 Loading LLaMA model: {model_name}")
         print("⚠️  Note: This may take several minutes on first run...")
         
-        self.model_name = model_name
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.opik_client = opik_client
         
-        # Configure quantization for memory efficiency
-        if use_4bit and torch.cuda.is_available():
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True
+        # Only load local model if not using remote
+        if not use_remote:
+            # Configure quantization for memory efficiency
+            if use_4bit and torch.cuda.is_available():
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True
+                )
+            else:
+                quantization_config = None
+            
+            # Load tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=True
             )
-        else:
-            quantization_config = None
-        
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=True
-        )
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Load model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=quantization_config,
-            device_map="auto",
-            trust_remote_code=True,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-        )
-        
-        # Create text generation pipeline
-        self.pipe = pipeline(
-            "text-generation",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            max_new_tokens=512,
-            temperature=0.7,
-            top_p=0.95,
-            repetition_penalty=1.15
-        )
-        
-        # Wrap as LangChain LLM
-        self.llm = HuggingFacePipeline(pipeline=self.pipe)
-        
-        print(f"✅ LLaMA model loaded on {self.device}")
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Load model
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map="auto",
+                trust_remote_code=True,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+            
+            # Create text generation pipeline
+            self.pipe = pipeline(
+                "text-generation",
+                model=self.model,
+                tokenizer=self.tokenizer,
+                max_new_tokens=512,
+                temperature=0.7,
+                top_p=0.95,
+                repetition_penalty=1.15
+            )
+            
+            # Wrap as LangChain LLM
+            self.llm = HuggingFacePipeline(pipeline=self.pipe)
+            
+            print(f"✅ LLaMA model loaded on {self.device}")
     
     def create_qa_chain(self, vectorstore: FAISS) -> ConversationalRetrievalChain:
         """
@@ -437,6 +574,11 @@ Helpful Answer:"""
         print("✅ QA chain created successfully")
         return qa_chain
     
+    @track(
+        name="rag_qa_question", 
+        tags=["rag", "qa"],
+        project_name="sentiment-analysis-rag"
+    )
     def ask_question(
         self,
         qa_chain: ConversationalRetrievalChain,
@@ -463,6 +605,42 @@ Helpful Answer:"""
         
         answer = result['answer']
         source_docs = result['source_documents']
+        
+        # Extract PDF context (the actual text from retrieved documents)
+        pdf_context = "\n\n---\n\n".join([
+            f"Source: {doc.metadata.get('source', 'Unknown')} (Page {doc.metadata.get('page', 'Unknown')})\n{doc.page_content}"
+            for doc in source_docs
+        ])
+        
+        # Update Opik context with RAG metadata
+        if OPIK_AVAILABLE:
+            try:
+                # Add to current span metadata
+                opik_context.update_current_span(
+                    metadata={
+                        "question": question,
+                        "num_source_documents": len(source_docs),
+                        "sources": [doc.metadata.get('source', 'Unknown') for doc in source_docs],
+                    }
+                )
+                
+                # Also add as tags for easier filtering
+                opik_context.update_current_trace(
+                    tags=["rag", "qa", "evaluated"]
+                )
+                
+                # IMPORTANT: Set these as output fields for evaluation
+                opik_context.update_current_span(
+                    output={
+                        "answer": answer,
+                        "chatbot_response": answer,
+                        "pdf_context": pdf_context,
+                        "sources": source_docs
+                    }
+                )
+                
+            except Exception as e:
+                print(f"⚠️  Opik context update warning: {e}")
         
         # Log to Opik if available
         if self.opik_client:
@@ -546,28 +724,35 @@ def setup_opik_tracing():
     """
     if not OPIK_AVAILABLE:
         return None
-    
+
     api_key = os.getenv("OPIK_API_KEY")
     workspace = os.getenv("OPIK_WORKSPACE", "default")
-    
+    project_name = os.getenv("OPIK_PROJECT", "sentiment-analysis-rag")
+
     if not api_key:
         print("\n⚠️  Opik API key not found. Set OPIK_API_KEY environment variable.")
         print("    Get your API key from: https://www.comet.com/opik")
         return None
-    
-    # Initialize Opik client
+
+    # Configure Opik globally (for decorator tracking)
     try:
+        configure(
+            api_key=api_key,
+            workspace=workspace
+        )
+        
+        # Initialize Opik client
         opik_client = Opik(
             api_key=api_key,
             workspace=workspace,
-            project_name="sentiment-analysis-rag"
+            project_name=project_name
         )
-        
+
         print("\n✅ Opik tracing enabled")
-        print(f"   Project: sentiment-analysis-rag")
+        print(f"   Project: {project_name}")
         print(f"   Workspace: {workspace}")
         print(f"   View traces at: https://www.comet.com/opik")
-        
+
         return opik_client
     except Exception as e:
         print(f"\n⚠️  Failed to initialize Opik: {e}")
@@ -596,73 +781,86 @@ def main():
     # Example: Create directory if it doesn't exist
     os.makedirs(PDF_DIRECTORY, exist_ok=True)
     
-    # Get all PDF files from directory
-    pdf_files = list(Path(PDF_DIRECTORY).glob("*.pdf"))
-    
-    if not pdf_files:
-        print(f"\n⚠️  No PDF files found in {PDF_DIRECTORY}")
-        print("   Please add PDF files to the directory and run again.")
-        print("\n   Example: Place your research papers in ./documents/")
-        
-        # For demonstration, create a sample instruction
-        print("\n" + "="*60)
-        print("📖 INSTRUCTIONS:")
-        print("="*60)
-        print("1. Create a 'documents' folder in this directory")
-        print("2. Add your PDF research papers on sentiment analysis")
-        print("3. Run this script again")
-        print("\nThe script will automatically:")
-        print("  - Detect if PDFs need OCR")
-        print("  - Extract and chunk the text")
-        print("  - Create embeddings")
-        print("  - Build a QA system")
-        return
-    
-    pdf_paths = [str(p) for p in pdf_files]
-    print(f"\n📁 Found {len(pdf_paths)} PDF files:")
-    for path in pdf_paths:
-        print(f"   - {os.path.basename(path)}")
-    
     # ========================================================================
-    # STEP 2: Extract text from PDFs
+    # STEP 2: Check if vector store already exists
     # ========================================================================
-    processor = PDFProcessor(ocr_enabled=True)
-    documents = processor.process_multiple_pdfs(pdf_paths)
-    
-    if not documents:
-        print("\n❌ No documents extracted. Exiting.")
-        return
-    
-    # ========================================================================
-    # STEP 3: Create embeddings and vector store
-    # ========================================================================
-    embedding_manager = EmbeddingManager()
-    
-    # Check if vector store already exists
     VECTOR_STORE_PATH = "./faiss_index"
+    embedding_manager = EmbeddingManager()
     vectorstore = embedding_manager.load_vector_store(VECTOR_STORE_PATH)
     
-    if vectorstore is None:
-        # Create new vector store
+    if vectorstore is not None:
+        # Vector store exists - skip PDF processing!
+        print("\n✅ Using existing vector store (skipping PDF processing)")
+        print("   Vector store contains pre-processed embeddings")
+        print("   To rebuild from PDFs, delete the ./faiss_index folder")
+    else:
+        # Vector store doesn't exist - process PDFs
+        print("\n📄 No existing vector store found - will process PDFs...")
+        
+        # Get all PDF files from directory
+        pdf_files = list(Path(PDF_DIRECTORY).glob("*.pdf"))
+        
+        if not pdf_files:
+            print(f"\n⚠️  No PDF files found in {PDF_DIRECTORY}")
+            print("   Please add PDF files to the directory and run again.")
+            print("\n   Example: Place your research papers in ./documents/")
+            
+            # For demonstration, create a sample instruction
+            print("\n" + "="*60)
+            print("📖 INSTRUCTIONS:")
+            print("="*60)
+            print("1. Create a 'documents' folder in this directory")
+            print("2. Add your PDF research papers on sentiment analysis")
+            print("3. Run this script again")
+            print("\nThe script will automatically:")
+            print("  - Detect if PDFs need OCR")
+            print("  - Extract and chunk the text")
+            print("  - Create embeddings")
+            print("  - Build a QA system")
+            return
+        
+        pdf_paths = [str(p) for p in pdf_files]
+        print(f"\n📁 Found {len(pdf_paths)} PDF files:")
+        for path in pdf_paths:
+            print(f"   - {os.path.basename(path)}")
+        
+        # ====================================================================
+        # STEP 3: Extract text from PDFs
+        # ====================================================================
+        processor = PDFProcessor(ocr_enabled=True)
+        documents = processor.process_multiple_pdfs(pdf_paths)
+        
+        if not documents:
+            print("\n❌ No documents extracted. Exiting.")
+            return
+        
+        # ====================================================================
+        # STEP 4: Create embeddings and vector store
+        # ====================================================================
         chunks = embedding_manager.chunk_documents(documents)
         vectorstore = embedding_manager.create_vector_store(chunks, VECTOR_STORE_PATH)
-    else:
-        print("   (Using existing vector store. Delete ./faiss_index to rebuild)")
     
     # ========================================================================
-    # STEP 4: Initialize LLaMA QA Agent
+    # STEP 5: Initialize LLaMA QA Agent
     # ========================================================================
+    # Check if using remote API
+    use_remote = os.getenv("USE_REMOTE_LLM", "false").lower() == "true"
+    api_base = os.getenv("OPENAI_API_BASE")
+    model_name = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+    
     qa_agent = LLaMAQAAgent(
-        model_name="meta-llama/Llama-3.1-8B-Instruct",
-        use_4bit=True,  # Use 4-bit quantization to reduce memory usage
-        opik_client=opik_client  # Pass Opik client for logging
+        model_name=model_name,
+        use_4bit=True,  # Use 4-bit quantization (for local models only)
+        opik_client=opik_client,  # Pass Opik client for logging
+        use_remote=use_remote,
+        api_base=api_base
     )
     
     # Create QA chain
     qa_chain = qa_agent.create_qa_chain(vectorstore)
     
     # ========================================================================
-    # STEP 5: Interactive QA Loop
+    # STEP 6: Interactive QA Loop
     # ========================================================================
     print("\n" + "="*60)
     print("💬 INTERACTIVE QA MODE")
