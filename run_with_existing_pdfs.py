@@ -47,6 +47,8 @@ from rag_sentiment_analysis import (
     LLaMAQAAgent,
     setup_opik_tracing
 )
+from langsmith_integration import log_rag_response_for_dashboard
+from pdf_source_extractor import PDFSourceIndex
 
 def main():
     """
@@ -88,6 +90,12 @@ def main():
         chunks = embedding_manager.chunk_documents(documents)
         vectorstore = embedding_manager.create_vector_store(chunks, VECTOR_STORE_PATH)
     
+    # Build or load verbatim PDF index for efficient lookup
+    pdf_index = PDFSourceIndex(PDF_DIRECTORY, cache_path="./pdf_page_index.json")
+    if not pdf_index.load_cache():
+        pdf_index.build()
+        pdf_index.save_cache()
+
     # ========================================================================
     # STEP 4: Initialize LLaMA QA Agent
     # ========================================================================
@@ -116,6 +124,10 @@ def main():
     
     # Create QA chain
     qa_chain = qa_agent.create_qa_chain(vectorstore)
+
+    # Build verbatim PDF index once for efficient lookup
+    pdf_index = PDFSourceIndex(PDF_DIRECTORY)
+    pdf_index.build()
     
     # ========================================================================
     # STEP 5: Interactive QA Loop
@@ -158,6 +170,16 @@ def main():
             # Display formatted answer with sources
             formatted_output = qa_agent.format_answer_with_sources(answer, sources)
             print(formatted_output)
+
+            pdf_context = pdf_index.build_context_from_sources(sources)
+
+            # Log for LangSmith dashboard evaluation (no local scoring)
+            log_rag_response_for_dashboard(
+                question=question,
+                context=pdf_context,
+                answer=answer,
+            )
+            print("\n📊 Logged to LangSmith for dashboard evaluation.")
         
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")

@@ -1,66 +1,59 @@
 from typing import Any, Dict, Optional
 
-from langsmith import Client, wrappers
-from openevals.llm import create_llm_as_judge
-from openevals.prompts import CORRECTNESS_PROMPT
-from openai import OpenAI
+from langsmith import traceable
 
-client = Client()
+HALLUCINATION_EVAL_PROMPT = """You are an expert data labeler evaluating model outputs for hallucinations.
 
-# Wrap the OpenAI client for LangSmith tracing (used by the judge)
-openai_client = wrappers.wrap_openai(OpenAI())
+Rubric:
+- The response contains only verifiable facts supported by the input context.
+- It makes no unsupported claims or assumptions.
+- It does not add speculative or imagined details.
+- Dates, numbers, and specific details are accurate.
+- It indicates uncertainty when information is incomplete.
+
+Instructions:
+- Read the input context thoroughly.
+- Identify all claims in the output.
+- Cross-reference each claim with the input context.
+- Note any unsupported or contradictory information.
+- Consider the severity and quantity of hallucinations.
+
+Use the following context to evaluate:
+Context:
+{inputs}
+
+Output:
+{outputs}
+
+Reference (if available):
+{reference_outputs}
+
+Return your reasoning as exactly 3 bullet points in order of importance.
+"""
 
 
-def correctness_evaluator(
-    inputs: Dict[str, Any],
-    outputs: Dict[str, Any],
-    reference_outputs: Dict[str, Any],
-) -> Dict[str, Any]:
-    evaluator = create_llm_as_judge(
-        prompt=CORRECTNESS_PROMPT,
-        model="openai:o3-mini",
-        feedback_key="correctness",
-    )
-    return evaluator(
-        inputs=inputs,
-        outputs=outputs,
-        reference_outputs=reference_outputs,
-    )
-
-
-def evaluate_rag_output(
-    user_input: str,
-    rag_output: str,
-    reference_output: Optional[str] = None,
+@traceable(
+    run_type="chain",
+    name="rag_response_for_eval",
+    metadata={
+        "evaluation_prompt": HALLUCINATION_EVAL_PROMPT,
+        "evaluation_summary_format": "3 bullet points",
+    },
+    process_inputs=lambda data: {
+        "question": data.get("question"),
+        "context": data.get("context"),
+    },
+)
+def log_rag_response_for_dashboard(
+    question: str,
+    context: str,
+    answer: str,
+    reference_outputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Evaluate a single RAG response using LangSmith + LLM-as-judge.
-
-    Args:
-        user_input: The question from the user.
-        rag_output: The answer returned by the RAG model.
-        reference_output: Optional ground-truth answer for correctness eval.
-
-    Returns:
-        A dictionary containing inputs, outputs, and optional feedback.
+    Log inputs/outputs to LangSmith for dashboard-based evaluation.
     """
-    inputs = {"question": user_input}
-    outputs = {"answer": rag_output}
-
-    if reference_output is None:
-        return {
-            "inputs": inputs,
-            "outputs": outputs,
-            "feedback": None,
-            "note": "No reference_output provided; correctness was not scored.",
-        }
-
-    reference_outputs = {"answer": reference_output}
-    feedback = correctness_evaluator(inputs, outputs, reference_outputs)
-
-    return {
-        "inputs": inputs,
-        "outputs": outputs,
-        "reference_outputs": reference_outputs,
-        "feedback": feedback,
-    }
+    payload: Dict[str, Any] = {"answer": answer}
+    if reference_outputs is not None:
+        payload["reference_outputs"] = reference_outputs
+    return payload
