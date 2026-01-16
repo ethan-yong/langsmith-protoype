@@ -47,7 +47,7 @@ from rag_sentiment_analysis import (
     LLaMAQAAgent,
     setup_opik_tracing
 )
-from langsmith_integration import log_rag_response_for_dashboard
+from langsmith_integration import log_and_evaluate_rag_response
 from pdf_source_extractor import PDFSourceIndex
 
 def main():
@@ -173,13 +173,18 @@ def main():
 
             pdf_context = pdf_index.build_context_from_sources(sources)
 
-            # Log for LangSmith dashboard evaluation (no local scoring)
-            log_rag_response_for_dashboard(
+            # Log and evaluate using LangSmith prompt evaluator
+            result = log_and_evaluate_rag_response(
                 question=question,
                 context=pdf_context,
                 answer=answer,
             )
-            print("\n📊 Logged to LangSmith for dashboard evaluation.")
+            
+            if result.get("evaluation"):
+                print("\n📊 Evaluation completed:")
+                print(result["evaluation"])
+            else:
+                print("\n📊 Logged to LangSmith (evaluation pending).")
         
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")

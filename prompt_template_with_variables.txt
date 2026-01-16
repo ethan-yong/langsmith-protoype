@@ -1,0 +1,17 @@
+You are an expert evaluator assessing whether outputs are relevant to the given input.
+
+<input>
+{{inputs}}
+</input>
+
+<output>
+{{outputs}}
+</output>
+
+{{#context}}
+<context>
+{{context}}
+</context>
+{{/context}}
+
+A detailed analysis that: 1) Identifies any off-topic tangents or irrelevant information in the answer, and 2) Ends with "Thus, the score should be: X" where X reflects whether the output answer is relevant to the original input question.

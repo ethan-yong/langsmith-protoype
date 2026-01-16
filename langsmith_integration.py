@@ -1,59 +1,796 @@
-from typing import Any, Dict, Optional
+import os
+import re
+import json
+from typing import Any, Dict, Optional, Callable
 
-from langsmith import traceable
+from langsmith import Client, traceable, RunTree
+from langsmith.run_helpers import get_current_run_tree
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_openai import ChatOpenAI
 
-HALLUCINATION_EVAL_PROMPT = """You are an expert data labeler evaluating model outputs for hallucinations.
+# Initialize LangSmith client
+_client = Client()
 
-Rubric:
-- The response contains only verifiable facts supported by the input context.
-- It makes no unsupported claims or assumptions.
-- It does not add speculative or imagined details.
-- Dates, numbers, and specific details are accurate.
-- It indicates uncertainty when information is incomplete.
+# Judge model configuration
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "openai/llama3:8b")
+JUDGE_API_BASE = os.getenv("OPENAI_API_BASE")
+JUDGE_API_KEY = os.getenv("OPENAI_API_KEY")
 
-Instructions:
-- Read the input context thoroughly.
-- Identify all claims in the output.
-- Cross-reference each claim with the input context.
-- Note any unsupported or contradictory information.
-- Consider the severity and quantity of hallucinations.
+# Cache for evaluators (created once, reused automatically)
+_evaluator_cache: Dict[str, Callable] = {}
 
-Use the following context to evaluate:
-Context:
-{inputs}
 
-Output:
-{outputs}
+def _create_judge_llm():
+    """Create LLM instance for evaluation."""
+    try:
+        if JUDGE_API_BASE:
+            # Use custom API base (e.g., LiteLLM)
+            return ChatOpenAI(
+                model=JUDGE_MODEL,
+                base_url=JUDGE_API_BASE,
+                api_key=JUDGE_API_KEY or "not-needed",
+                temperature=0.0,
+            )
+        else:
+            # Use default OpenAI
+            return ChatOpenAI(
+                model=JUDGE_MODEL,
+                api_key=JUDGE_API_KEY,
+                temperature=0.0,
+            )
+    except Exception as e:
+        print(f"⚠️  Failed to create judge LLM: {e}")
+        return None
 
-Reference (if available):
-{reference_outputs}
 
-Return your reasoning as exactly 3 bullet points in order of importance.
-"""
+def create_relevance_evaluator() -> Callable:
+    """
+    Create a relevance evaluator that assesses if the output is relevant to the input.
+    
+    Returns:
+        Evaluator function that can be used with LangSmith
+    """
+    judge_llm = _create_judge_llm()
+    if not judge_llm:
+        return None
+    
+    # Define the evaluation prompt
+    relevance_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert evaluator assessing whether outputs are relevant to the given input.
+
+A detailed analysis that: 1) Identifies any off-topic tangents or irrelevant information in the answer, and 2) Ends with "Thus, the score should be: X" where X reflects whether the output answer is relevant to the original input question.
+
+Score from 1 to 10. 10 if the output answer directly and effectively addresses the original input question based on the specified criteria, 1 otherwise."""),
+        ("human", """<input>
+{{inputs}}
+</input>
+
+<output>
+{{outputs}}
+</output>
+
+{{#context}}
+<context>
+{{context}}
+</context>
+{{/context}}
+
+Provide your evaluation:""")
+    ])
+    
+    # Create structured output schema
+    from langchain_core.output_parsers import JsonOutputParser
+    from langchain_core.pydantic_v1 import BaseModel, Field
+    
+    class RelevanceEvaluation(BaseModel):
+        comment: str = Field(description="A detailed analysis that identifies any off-topic tangents or irrelevant information in the answer")
+        answer_relevance: str = Field(description="Score from 1 to 10. 10 if the output answer directly and effectively addresses the original input question based on the specified criteria, 1 otherwise.", enum=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
+    
+    parser = JsonOutputParser(pydantic_object=RelevanceEvaluation)
+    
+    # Create the evaluator chain
+    evaluator_chain = relevance_prompt | judge_llm | parser
+    
+    def relevance_evaluator(run, example=None) -> Dict[str, Any]:
+        """
+        Evaluate relevance of the output to the input.
+        
+        Args:
+            run: LangSmith Run object
+            example: Optional example with reference outputs
+            
+        Returns:
+            Dictionary with evaluation results
+        """
+        try:
+            # Extract inputs and outputs from run
+            inputs = run.inputs if hasattr(run, 'inputs') else {}
+            outputs = run.outputs if hasattr(run, 'outputs') else {}
+            
+            # Format inputs for the evaluator
+            eval_inputs = {
+                "inputs": inputs.get("question", inputs.get("inputs", "")),
+                "outputs": outputs.get("answer", outputs.get("outputs", "")),
+            }
+            
+            # Add context if available
+            if "context" in inputs:
+                eval_inputs["context"] = inputs["context"]
+            
+            # Invoke the evaluator
+            result = evaluator_chain.invoke(eval_inputs)
+            
+            # Extract score
+            score_str = result.get("answer_relevance", "5")
+            try:
+                score = float(score_str) / 10.0  # Normalize to 0-1
+            except (ValueError, TypeError):
+                score = 0.5
+            
+            return {
+                "key": "relevance_score",
+                "score": score,
+                "comment": result.get("comment", ""),
+                "raw_result": result,
+            }
+        except Exception as e:
+            print(f"⚠️  Relevance evaluation failed: {e}")
+            return {
+                "key": "relevance_score",
+                "score": None,
+                "comment": f"Evaluation error: {str(e)}",
+            }
+    
+    return relevance_evaluator
+
+
+def create_helpfulness_evaluator() -> Callable:
+    """
+    Create a helpfulness evaluator that assesses how helpful the output is.
+    
+    Returns:
+        Evaluator function that can be used with LangSmith
+    """
+    judge_llm = _create_judge_llm()
+    if not judge_llm:
+        return None
+    
+    helpfulness_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert evaluator assessing how helpful an output is in addressing the user's question.
+
+A detailed analysis that: 1) Identifies how well the answer addresses the question, 2) Notes any missing information or areas for improvement, and 3) Ends with "Thus, the score should be: X" where X reflects how helpful the output is.
+
+Score from 1 to 10. 10 if the output is extremely helpful and comprehensive, 1 if it's not helpful at all."""),
+        ("human", """<input>
+{{inputs}}
+</input>
+
+<output>
+{{outputs}}
+</output>
+
+{{#context}}
+<context>
+{{context}}
+</context>
+{{/context}}
+
+Provide your evaluation:""")
+    ])
+    
+    from langchain_core.output_parsers import JsonOutputParser
+    from langchain_core.pydantic_v1 import BaseModel, Field
+    
+    class HelpfulnessEvaluation(BaseModel):
+        comment: str = Field(description="A detailed analysis of how helpful the answer is")
+        helpfulness_score: str = Field(description="Score from 1 to 10. 10 if the output is extremely helpful and comprehensive, 1 if it's not helpful at all.", enum=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
+    
+    parser = JsonOutputParser(pydantic_object=HelpfulnessEvaluation)
+    evaluator_chain = helpfulness_prompt | judge_llm | parser
+    
+    def helpfulness_evaluator(run, example=None) -> Dict[str, Any]:
+        """Evaluate helpfulness of the output."""
+        try:
+            inputs = run.inputs if hasattr(run, 'inputs') else {}
+            outputs = run.outputs if hasattr(run, 'outputs') else {}
+            
+            eval_inputs = {
+                "inputs": inputs.get("question", inputs.get("inputs", "")),
+                "outputs": outputs.get("answer", outputs.get("outputs", "")),
+            }
+            
+            if "context" in inputs:
+                eval_inputs["context"] = inputs["context"]
+            
+            result = evaluator_chain.invoke(eval_inputs)
+            score_str = result.get("helpfulness_score", "5")
+            try:
+                score = float(score_str) / 10.0
+            except (ValueError, TypeError):
+                score = 0.5
+            
+            return {
+                "key": "helpfulness_score",
+                "score": score,
+                "comment": result.get("comment", ""),
+                "raw_result": result,
+            }
+        except Exception as e:
+            print(f"⚠️  Helpfulness evaluation failed: {e}")
+            return {
+                "key": "helpfulness_score",
+                "score": None,
+                "comment": f"Evaluation error: {str(e)}",
+            }
+    
+    return helpfulness_evaluator
+
+
+def get_all_evaluators(use_cache: bool = True) -> Dict[str, Callable]:
+    """
+    Get all available evaluators (cached for efficiency).
+    
+    Evaluators are automatically cached after first creation, so you don't need to
+    recreate them on every evaluation call. Just call log_and_evaluate_rag_response()
+    and it will use cached evaluators automatically.
+    
+    Args:
+        use_cache: If True, use cached evaluators. If False, create new ones.
+    
+    Returns:
+        Dictionary mapping evaluator names to evaluator functions
+    """
+    if use_cache and _evaluator_cache:
+        return _evaluator_cache.copy()
+    
+    evaluators = {}
+    
+    # Check cache first
+    if "relevance" in _evaluator_cache:
+        evaluators["relevance"] = _evaluator_cache["relevance"]
+    else:
+        relevance_eval = create_relevance_evaluator()
+        if relevance_eval:
+            evaluators["relevance"] = relevance_eval
+            if use_cache:
+                _evaluator_cache["relevance"] = relevance_eval
+    
+    if "helpfulness" in _evaluator_cache:
+        evaluators["helpfulness"] = _evaluator_cache["helpfulness"]
+    else:
+        helpfulness_eval = create_helpfulness_evaluator()
+        if helpfulness_eval:
+            evaluators["helpfulness"] = helpfulness_eval
+            if use_cache:
+                _evaluator_cache["helpfulness"] = helpfulness_eval
+    
+    return evaluators
+
+
+def get_default_evaluators(use_cache: bool = True) -> list:
+    """
+    Get default list of evaluators to use (cached for efficiency).
+    
+    Args:
+        use_cache: If True, use cached evaluators. If False, create new ones.
+    
+    Returns:
+        List of evaluator functions
+    """
+    all_evals = get_all_evaluators(use_cache=use_cache)
+    # Return relevance evaluator by default
+    if "relevance" in all_evals:
+        return [all_evals["relevance"]]
+    return list(all_evals.values())
+
+
+def clear_evaluator_cache():
+    """Clear the evaluator cache (useful for testing or reconfiguration)."""
+    global _evaluator_cache
+    _evaluator_cache.clear()
+    print("✅ Evaluator cache cleared")
+
+
+def push_evaluators_to_dashboard(
+    evaluator_names: Optional[list] = None,
+    prompt_prefix: str = "eval_",
+    include_model: bool = False,
+) -> Dict[str, str]:
+    """
+    Push evaluator prompts to LangSmith dashboard so they appear as reusable evaluators.
+    
+    IMPORTANT: This pushes the PROMPT TEMPLATE only, not the model configuration.
+    When you use these prompts in LangSmith UI, you'll need to:
+    1. Select the prompt you pushed
+    2. Configure the model (model name, API base, API key) in the LangSmith UI
+    
+    This is by design - model configuration and API keys should be set in LangSmith
+    for security and flexibility, not hardcoded in the prompt.
+    
+    This allows you to use the evaluators in the LangSmith UI for:
+    - Online evaluations (continuous evaluation on traces)
+    - Dataset experiments
+    - Manual evaluation runs
+    
+    After pushing, you can find these prompts in the LangSmith dashboard under Prompts,
+    and use them to configure evaluators in the UI.
+    
+    Args:
+        evaluator_names: List of evaluator names to push (e.g., ["relevance", "helpfulness"]).
+                        If None, pushes all available evaluators.
+        prompt_prefix: Prefix for prompt names in LangSmith (e.g., "eval_relevance_score")
+        include_model: If True, includes model info in the push (but NOT API keys).
+                      If False, pushes only the prompt template (recommended).
+    
+    Returns:
+        Dictionary mapping evaluator names to their prompt IDs in LangSmith
+    """
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import JsonOutputParser
+    from langchain_core.pydantic_v1 import BaseModel, Field
+    
+    pushed_prompts = {}
+    
+    # Get evaluators to push
+    if evaluator_names is None:
+        evaluator_names = list(get_all_evaluators().keys())
+    
+    # Push relevance evaluator
+    if "relevance" in evaluator_names:
+        try:
+            judge_llm = _create_judge_llm()
+            if not judge_llm:
+                print("⚠️  Cannot push relevance evaluator: judge LLM not available")
+            else:
+                # Create the prompt structure (same as in create_relevance_evaluator)
+                relevance_prompt = ChatPromptTemplate.from_messages([
+                    ("system", """You are an expert evaluator assessing whether outputs are relevant to the given input.
+
+A detailed analysis that: 1) Identifies any off-topic tangents or irrelevant information in the answer, and 2) Ends with "Thus, the score should be: X" where X reflects whether the output answer is relevant to the original input question.
+
+Score from 1 to 10. 10 if the output answer directly and effectively addresses the original input question based on the specified criteria, 1 otherwise."""),
+                    ("human", """<input>
+{{inputs}}
+</input>
+
+<output>
+{{outputs}}
+</output>
+
+{{#context}}
+<context>
+{{context}}
+</context>
+{{/context}}
+
+Provide your evaluation:""")
+                ])
+                
+                # Create schema
+                class RelevanceEvaluation(BaseModel):
+                    comment: str = Field(description="A detailed analysis that identifies any off-topic tangents or irrelevant information in the answer")
+                    answer_relevance: str = Field(description="Score from 1 to 10. 10 if the output answer directly and effectively addresses the original input question based on the specified criteria, 1 otherwise.", enum=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
+                
+                parser = JsonOutputParser(pydantic_object=RelevanceEvaluation)
+                evaluator_chain = relevance_prompt | judge_llm | parser
+                
+                # Push to LangSmith
+                prompt_name = f"{prompt_prefix}relevance_score"
+                try:
+                    _client.push_prompt(
+                        prompt_name,
+                        object=evaluator_chain,
+                    )
+                    pushed_prompts["relevance"] = prompt_name
+                    print(f"✅ Pushed relevance evaluator as: {prompt_name}")
+                    print(f"   You can now use this in the LangSmith dashboard!")
+                except Exception as e:
+                    print(f"⚠️  Failed to push relevance evaluator: {e}")
+        except Exception as e:
+            print(f"⚠️  Error pushing relevance evaluator: {e}")
+    
+    # Push helpfulness evaluator
+    if "helpfulness" in evaluator_names:
+        try:
+            judge_llm = _create_judge_llm()
+            if not judge_llm:
+                print("⚠️  Cannot push helpfulness evaluator: judge LLM not available")
+            else:
+                helpfulness_prompt = ChatPromptTemplate.from_messages([
+                    ("system", """You are an expert evaluator assessing how helpful an output is in addressing the user's question.
+
+A detailed analysis that: 1) Identifies how well the answer addresses the question, 2) Notes any missing information or areas for improvement, and 3) Ends with "Thus, the score should be: X" where X reflects how helpful the output is.
+
+Score from 1 to 10. 10 if the output is extremely helpful and comprehensive, 1 if it's not helpful at all."""),
+                    ("human", """<input>
+{{inputs}}
+</input>
+
+<output>
+{{outputs}}
+</output>
+
+{{#context}}
+<context>
+{{context}}
+</context>
+{{/context}}
+
+Provide your evaluation:""")
+                ])
+                
+                class HelpfulnessEvaluation(BaseModel):
+                    comment: str = Field(description="A detailed analysis of how helpful the answer is")
+                    helpfulness_score: str = Field(description="Score from 1 to 10. 10 if the output is extremely helpful and comprehensive, 1 if it's not helpful at all.", enum=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
+                
+                parser = JsonOutputParser(pydantic_object=HelpfulnessEvaluation)
+                evaluator_chain = helpfulness_prompt | judge_llm | parser
+                
+                prompt_name = f"{prompt_prefix}helpfulness_score"
+                try:
+                    _client.push_prompt(
+                        prompt_name,
+                        object=evaluator_chain,
+                    )
+                    pushed_prompts["helpfulness"] = prompt_name
+                    print(f"✅ Pushed helpfulness evaluator as: {prompt_name}")
+                    print(f"   You can now use this in the LangSmith dashboard!")
+                except Exception as e:
+                    print(f"⚠️  Failed to push helpfulness evaluator: {e}")
+        except Exception as e:
+            print(f"⚠️  Error pushing helpfulness evaluator: {e}")
+    
+    if pushed_prompts:
+        print(f"\n📊 Summary: Pushed {len(pushed_prompts)} evaluator(s) to LangSmith")
+        print("   To use them in the dashboard:")
+        print("   1. Go to LangSmith Dashboard > Prompts")
+        print("   2. Find your pushed prompts (e.g., 'eval_relevance_score')")
+        print("   3. Use them to configure evaluators in Tracing Projects or Datasets")
+    
+    return pushed_prompts
+
+
+def _extract_score_from_evaluation(evaluation_result: Any) -> Optional[float]:
+    """Extract numeric score from evaluation result."""
+    if evaluation_result is None:
+        return None
+    
+    # If it's a string, try to extract a number
+    if isinstance(evaluation_result, str):
+        # Look for patterns like "Score: 4.5" or "4.5/5" or just "4.5"
+        numbers = re.findall(r'\d+\.?\d*', evaluation_result)
+        if numbers:
+            try:
+                return float(numbers[0])
+            except ValueError:
+                pass
+    
+    # If it's a dict, look for common score keys
+    if isinstance(evaluation_result, dict):
+        for key in ["score", "rating", "value", "relevance_score"]:
+            if key in evaluation_result:
+                val = evaluation_result[key]
+                if isinstance(val, (int, float)):
+                    return float(val)
+                elif isinstance(val, str):
+                    numbers = re.findall(r'\d+\.?\d*', val)
+                    if numbers:
+                        try:
+                            return float(numbers[0])
+                        except ValueError:
+                            pass
+    
+    # If it's a number directly
+    if isinstance(evaluation_result, (int, float)):
+        return float(evaluation_result)
+    
+    return None
 
 
 @traceable(
     run_type="chain",
     name="rag_response_for_eval",
-    metadata={
-        "evaluation_prompt": HALLUCINATION_EVAL_PROMPT,
-        "evaluation_summary_format": "3 bullet points",
-    },
     process_inputs=lambda data: {
         "question": data.get("question"),
         "context": data.get("context"),
     },
 )
-def log_rag_response_for_dashboard(
+def log_and_evaluate_rag_response(
     question: str,
     context: str,
     answer: str,
     reference_outputs: Optional[Dict[str, Any]] = None,
+    evaluators: Optional[list] = None,
 ) -> Dict[str, Any]:
     """
-    Log inputs/outputs to LangSmith for dashboard-based evaluation.
+    Log inputs/outputs to LangSmith and evaluate using custom evaluator objects.
+    Creates feedback with score for dashboard display.
+    
+    Evaluators are automatically cached, so you don't need to call create_relevance_evaluator()
+    every time. Just call this function and it will use cached evaluators automatically.
+    
+    Args:
+        question: User's question
+        context: PDF context used for answering
+        answer: Generated answer
+        reference_outputs: Optional reference outputs for comparison
+        evaluators: Optional list of evaluator functions. If None, uses default cached relevance evaluator.
+    
+    Returns:
+        Dictionary with answer, evaluation results, and scores
     """
-    payload: Dict[str, Any] = {"answer": answer}
+    # Get current run tree for evaluation
+    run_tree = get_current_run_tree()
+    
+    if not run_tree or not run_tree.id:
+        print("⚠️  No active run tree found. Evaluation skipped.")
+        return {
+            "answer": answer,
+            "evaluation": None,
+        }
+    
+    # Create a mock run object for evaluators
+    class MockRun:
+        def __init__(self, inputs, outputs):
+            self.inputs = inputs
+            self.outputs = outputs
+            self.id = run_tree.id
+    
+    mock_run = MockRun(
+        inputs={"question": question, "context": context},
+        outputs={"answer": answer}
+    )
+    
+    # Use provided evaluators or default evaluators (cached)
+    if evaluators is None:
+        evaluators = get_default_evaluators(use_cache=True)
+        if not evaluators:
+            print("⚠️  Could not create evaluators. Evaluation skipped.")
+            return {
+                "answer": answer,
+                "evaluation": None,
+            }
+    
+    # Run all evaluators
+    evaluation_results = {}
+    all_scores = {}
+    
+    for evaluator in evaluators:
+        try:
+            result = evaluator(mock_run, example=None)
+            if result:
+                key = result.get("key", "evaluation")
+                evaluation_results[key] = result
+                
+                # Create feedback in LangSmith
+                score = result.get("score")
+                comment = result.get("comment", "")
+                
+                if score is not None:
+                    all_scores[key] = score
+                    try:
+                        _client.create_feedback(
+                            run_id=run_tree.id,
+                            key=key,
+                            score=score,
+                            comment=comment if comment else None,
+                        )
+                    except Exception as e:
+                        print(f"⚠️  Failed to create feedback for {key}: {e}")
+        except Exception as e:
+            print(f"⚠️  Evaluator {evaluator.__name__ if hasattr(evaluator, '__name__') else 'unknown'} failed: {e}")
+    
+    payload: Dict[str, Any] = {
+        "answer": answer,
+        "evaluation": evaluation_results,
+    }
+    if all_scores:
+        payload["scores"] = all_scores
     if reference_outputs is not None:
         payload["reference_outputs"] = reference_outputs
+    
     return payload
+
+
+def evaluate_query_and_output(
+    question: str,
+    context: str,
+    answer: str,
+    run_id: Optional[str] = None,
+    project_name: Optional[str] = None,
+    evaluators: Optional[list] = None,
+    reference_outputs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Evaluate a query and output pair, optionally linking to an existing run.
+    
+    This function can be used to evaluate queries and outputs later, even if
+    there's no active trace. It will create a run in LangSmith if run_id is not provided.
+    
+    Args:
+        question: User's question
+        context: PDF context used for answering
+        answer: Generated answer
+        run_id: Optional existing run ID to attach feedback to. If None, creates a new run.
+        project_name: Optional project name for the run (uses LANGSMITH_PROJECT env var if not provided)
+        evaluators: Optional list of evaluator functions. If None, uses default cached relevance evaluator.
+        reference_outputs: Optional reference outputs for comparison
+    
+    Returns:
+        Dictionary with evaluation results, scores, and run_id
+    """
+    from datetime import datetime
+    
+    # Use provided evaluators or default evaluators (cached)
+    if evaluators is None:
+        evaluators = get_default_evaluators(use_cache=True)
+        if not evaluators:
+            print("⚠️  Could not create evaluators. Evaluation skipped.")
+            return {
+                "answer": answer,
+                "evaluation": None,
+            }
+    
+    # Create or use existing run
+    if run_id is None:
+        # Create a new run for this evaluation
+        project = project_name or os.getenv("LANGSMITH_PROJECT", "rag-evaluation")
+        
+        try:
+            # Create a run using RunTree
+            run_tree = RunTree(
+                name="rag_qa",
+                run_type="chain",
+                inputs={"question": question, "context": context},
+                outputs={"answer": answer},
+                project_name=project,
+            )
+            run_tree.end()
+            run_id = run_tree.id
+            print(f"✅ Created new run: {run_id}")
+        except Exception as e:
+            print(f"⚠️  Failed to create run: {e}")
+            print("   Continuing with evaluation (results won't be linked to a run)")
+            # Continue with evaluation even if run creation fails
+            run_id = None
+    else:
+        print(f"✅ Using existing run: {run_id}")
+    
+    # Create a mock run object for evaluators
+    class MockRun:
+        def __init__(self, inputs, outputs, run_id):
+            self.inputs = inputs
+            self.outputs = outputs
+            self.id = run_id
+    
+    mock_run = MockRun(
+        inputs={"question": question, "context": context},
+        outputs={"answer": answer},
+        run_id=run_id or "no-run-id"
+    )
+    
+    # Run all evaluators
+    evaluation_results = {}
+    all_scores = {}
+    
+    for evaluator in evaluators:
+        try:
+            result = evaluator(mock_run, example=None)
+            if result:
+                key = result.get("key", "evaluation")
+                evaluation_results[key] = result
+                
+                # Create feedback in LangSmith if we have a run_id
+                score = result.get("score")
+                comment = result.get("comment", "")
+                
+                if score is not None:
+                    all_scores[key] = score
+                    if run_id:
+                        try:
+                            _client.create_feedback(
+                                run_id=run_id,
+                                key=key,
+                                score=score,
+                                comment=comment if comment else None,
+                            )
+                        except Exception as e:
+                            print(f"⚠️  Failed to create feedback for {key}: {e}")
+        except Exception as e:
+            print(f"⚠️  Evaluator {evaluator.__name__ if hasattr(evaluator, '__name__') else 'unknown'} failed: {e}")
+    
+    payload: Dict[str, Any] = {
+        "answer": answer,
+        "evaluation": evaluation_results,
+        "run_id": run_id,
+    }
+    if all_scores:
+        payload["scores"] = all_scores
+    if reference_outputs is not None:
+        payload["reference_outputs"] = reference_outputs
+    
+    return payload
+
+
+def evaluate_existing_runs(
+    run_ids: list,
+    evaluators: Optional[list] = None,
+) -> Dict[str, Any]:
+    """
+    Evaluate existing runs from LangSmith by their IDs.
+    
+    This is useful for evaluating runs that were created earlier.
+    
+    Args:
+        run_ids: List of run IDs to evaluate
+        evaluators: Optional list of evaluator functions. If None, uses default cached relevance evaluator.
+    
+    Returns:
+        Dictionary mapping run_id to evaluation results
+    """
+    # Use provided evaluators or default evaluators (cached)
+    if evaluators is None:
+        evaluators = get_default_evaluators(use_cache=True)
+        if not evaluators:
+            print("⚠️  Could not create evaluators. Evaluation skipped.")
+            return {}
+    
+    results = {}
+    
+    for run_id in run_ids:
+        try:
+            # Fetch the run from LangSmith
+            run = _client.read_run(run_id)
+            
+            # Extract inputs and outputs
+            inputs = run.inputs if hasattr(run, 'inputs') else {}
+            outputs = run.outputs if hasattr(run, 'outputs') else {}
+            
+            # Create a mock run object for evaluators
+            class MockRun:
+                def __init__(self, inputs, outputs, run_id):
+                    self.inputs = inputs
+                    self.outputs = outputs
+                    self.id = run_id
+            
+            mock_run = MockRun(inputs=inputs, outputs=outputs, run_id=run_id)
+            
+            # Run all evaluators
+            evaluation_results = {}
+            all_scores = {}
+            
+            for evaluator in evaluators:
+                try:
+                    result = evaluator(mock_run, example=None)
+                    if result:
+                        key = result.get("key", "evaluation")
+                        evaluation_results[key] = result
+                        
+                        # Create feedback in LangSmith
+                        score = result.get("score")
+                        comment = result.get("comment", "")
+                        
+                        if score is not None:
+                            all_scores[key] = score
+                            try:
+                                _client.create_feedback(
+                                    run_id=run_id,
+                                    key=key,
+                                    score=score,
+                                    comment=comment if comment else None,
+                                )
+                            except Exception as e:
+                                print(f"⚠️  Failed to create feedback for {key} on run {run_id}: {e}")
+                except Exception as e:
+                    print(f"⚠️  Evaluator failed for run {run_id}: {e}")
+            
+            results[run_id] = {
+                "evaluation": evaluation_results,
+                "scores": all_scores,
+            }
+            
+        except Exception as e:
+            print(f"⚠️  Failed to evaluate run {run_id}: {e}")
+            results[run_id] = {"error": str(e)}
+    
+    return results
