@@ -10,6 +10,7 @@ langchain>=0.3.18,<0.4.0
 langchain-community>=0.3.18,<0.4.0
 langchain-openai>=0.3.6,<0.4.0
 langchain-text-splitters>=0.3.0,<0.4.0
+langgraph>=0.2.0  # For stateful, graph-based RAG workflows
 
 # Vector Store
 faiss-cpu==1.13.2  # Use faiss-gpu if you have GPU with CUDA

@@ -332,7 +332,7 @@ class LLaMAQAAgent:
     
     def __init__(
         self,
-        model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
+        model_name: str = None,
         use_4bit: bool = True,
         opik_client=None,
         use_remote: bool = False,
@@ -342,12 +342,32 @@ class LLaMAQAAgent:
         Initialize the QA agent with LLaMA model or remote API.
         
         Args:
-            model_name: HuggingFace model name or remote model name
+            model_name: HuggingFace model name or remote model name. If None, reads from LLM_MODEL env var.
             use_4bit: Whether to use 4-bit quantization (local only)
             opik_client: Optional Opik client for logging
-            use_remote: Use remote OpenAI-compatible API instead of local model
-            api_base: Base URL for remote API (e.g., http://192.168.2.134:31180)
+            use_remote: Use remote OpenAI-compatible API instead of local model. If None, reads from USE_REMOTE_LLM env var.
+            api_base: Base URL for remote API (e.g., http://192.168.2.134:31180). If None, reads from OPENAI_API_BASE env var.
         """
+        # Read model name from environment if not provided
+        if model_name is None:
+            model_name = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+        
+        # Read use_remote from environment if not explicitly provided (check if it's the default False)
+        # If use_remote was explicitly set to True, keep it. Otherwise read from env.
+        if not use_remote:  # If False (default), check environment
+            use_remote = os.getenv("USE_REMOTE_LLM", "false").lower() == "true"
+        
+        # Auto-detect remote model format: if model name contains ':' it's likely a remote model (e.g., "llama3:8b")
+        # HuggingFace model IDs don't use colons, so this is a good indicator
+        if not use_remote and ':' in model_name:
+            print(f"💡 Detected remote model format in '{model_name}' (contains ':')")
+            print("   Auto-enabling remote mode. Set USE_REMOTE_LLM=true to suppress this message.")
+            use_remote = True
+        
+        # Read api_base from environment if not provided
+        if api_base is None:
+            api_base = os.getenv("OPENAI_API_BASE")
+        
         self.model_name = model_name
         self.opik_client = opik_client
         self.use_remote = use_remote
@@ -549,11 +569,17 @@ Helpful Answer:"""
         )
         
         # Initialize conversation memory
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"
-        )
+        # Note: ConversationBufferMemory shows deprecation warning but still works
+        # The warning is about future changes - the current API still functions correctly
+        # For ConversationalRetrievalChain, ConversationBufferMemory is still the correct choice
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain")
+            memory = ConversationBufferMemory(
+                memory_key="chat_history",
+                return_messages=True,
+                output_key="answer"
+            )
         
         # Create retriever from vector store
         retriever = vectorstore.as_retriever(
@@ -562,16 +588,48 @@ Helpful Answer:"""
         )
         
         # Create conversational retrieval chain
-        qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
-            retriever=retriever,
-            memory=memory,
-            return_source_documents=True,
-            combine_docs_chain_kwargs={"prompt": QA_PROMPT},
-            verbose=True
-        )
+        print("   Creating ConversationalRetrievalChain...")
+        import sys
+        sys.stdout.flush()
         
+        print("   [DEBUG] About to call ConversationalRetrievalChain.from_llm()...")
+        sys.stdout.flush()
+        print(f"   [DEBUG] LLM type: {type(self.llm)}")
+        sys.stdout.flush()
+        print(f"   [DEBUG] Retriever type: {type(retriever)}")
+        sys.stdout.flush()
+        print(f"   [DEBUG] Memory type: {type(memory)}")
+        sys.stdout.flush()
+        
+        try:
+            print("   [DEBUG] Calling ConversationalRetrievalChain.from_llm() NOW...")
+            sys.stdout.flush()
+            
+            qa_chain = ConversationalRetrievalChain.from_llm(
+                llm=self.llm,
+                retriever=retriever,
+                memory=memory,
+                return_source_documents=True,
+                combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+                verbose=False  # Disable verbose to avoid hanging
+            )
+            
+            print("   [DEBUG] ConversationalRetrievalChain.from_llm() returned!")
+            sys.stdout.flush()
+            print("   ✅ ConversationalRetrievalChain created")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"   ❌ Failed to create ConversationalRetrievalChain: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        
+        print("   [DEBUG] About to print success message...")
+        sys.stdout.flush()
         print("✅ QA chain created successfully")
+        sys.stdout.flush()
+        print("✅ QA chain created successfully")
+        sys.stdout.flush()
         return qa_chain
     
     @track(
@@ -843,37 +901,73 @@ def main():
     # ========================================================================
     # STEP 5: Initialize LLaMA QA Agent
     # ========================================================================
-    # Check if using remote API
-    use_remote = os.getenv("USE_REMOTE_LLM", "false").lower() == "true"
-    api_base = os.getenv("OPENAI_API_BASE")
-    model_name = os.getenv("LLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+    # LLaMAQAAgent will read model configuration from environment variables
+    # You can override by passing parameters, but by default it reads from:
+    # - LLM_MODEL: Model name
+    # - USE_REMOTE_LLM: Whether to use remote API (true/false)
+    # - OPENAI_API_BASE: API base URL for remote LLM
     
     qa_agent = LLaMAQAAgent(
-        model_name=model_name,
+        model_name=None,  # Will read from LLM_MODEL env var
         use_4bit=True,  # Use 4-bit quantization (for local models only)
         opik_client=opik_client,  # Pass Opik client for logging
-        use_remote=use_remote,
-        api_base=api_base
+        use_remote=False,  # Will read from USE_REMOTE_LLM env var if False
+        api_base=None  # Will read from OPENAI_API_BASE env var
     )
     
-    # Create QA chain
-    qa_chain = qa_agent.create_qa_chain(vectorstore)
-    
     # ========================================================================
-    # STEP 6: Interactive QA Loop
+    # STEP 6: Create Fresh QA Chain Before First Question
     # ========================================================================
     print("\n" + "="*60)
     print("💬 INTERACTIVE QA MODE")
     print("="*60)
     print("Ask questions about sentiment analysis from your research papers.")
     print("Type 'quit' or 'exit' to stop.")
-    print("The system has conversation memory, so you can ask follow-up questions!")
+    print("Note: A fresh QA chain will be created before answering your first question.")
     print("="*60)
+    
+    # Create fresh QA chain before first question
+    print("\n⏳ Creating fresh QA chain before first question...")
+    import sys
+    sys.stdout.flush()
+    
+    try:
+        # Clear any existing QA chain state by creating a completely new one
+        print("   Creating new QA chain...")
+        sys.stdout.flush()
+        print("   [DEBUG] About to call qa_agent.create_qa_chain()...")
+        sys.stdout.flush()
+        
+        qa_chain = qa_agent.create_qa_chain(vectorstore)
+        
+        print("   [DEBUG] ⭐⭐ RETURNED FROM create_qa_chain()! ⭐⭐")
+        sys.stdout.flush()
+        print("   ✅ Fresh QA chain created successfully")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"\n❌ Failed to create QA chain: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    print("\n" + "="*60)
+    print("✅ QA CHAIN READY - STARTING INTERACTIVE MODE")
+    print("="*60)
+    print("\n💡 You can now ask questions about your research papers.")
+    print("   Type 'quit' or 'exit' to stop.\n")
+    sys.stdout.flush()
+    
+    # ========================================================================
+    # STEP 7: Interactive QA Loop
+    # ========================================================================
     
     while True:
         try:
-            # Get user input
-            question = input("\n👤 Your question: ").strip()
+            # Get user input - make sure prompt is visible
+            print("\n" + "-"*60)  # Visual separator
+            sys.stdout.flush()
+            print("👤 Your question: ", end="", flush=True)  # Print prompt without newline
+            question = input().strip()  # Get input on same line
             
             if not question:
                 continue
@@ -882,7 +976,7 @@ def main():
                 print("\n👋 Goodbye!")
                 break
             
-            # Get answer
+            # Get answer using QA chain (already created fresh before first question)
             answer, sources = qa_agent.ask_question(qa_chain, question)
             
             # Display formatted answer with sources
