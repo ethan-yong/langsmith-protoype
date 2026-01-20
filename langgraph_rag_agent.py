@@ -280,12 +280,14 @@ Answer:""")
             score = 0.5
             comment = f"Evaluation failed: {str(e)}"
         
-        # Track score history
+        # Track score history with k value
         iteration = state.get("refinement_count", 0) + 1
+        k_value = state.get("retrieval_k", 0)
         score_history = state.get("score_history", [])
         score_history.append({
             "iteration": iteration,
             "score": score,
+            "k": k_value,
             "comment": comment[:100]  # Truncated for history
         })
         
@@ -293,9 +295,9 @@ Answer:""")
         if len(score_history) > 1:
             prev_score = score_history[-2]["score"]
             improvement = score - prev_score
-            print(f"   [Iteration {iteration}] Quality Score: {score:.2f} (Change: {improvement:+.2f})")
+            print(f"   [Iteration {iteration}] Quality Score: {score:.2f} (Change: {improvement:+.2f}) | k={k_value}")
         else:
-            print(f"   [Iteration {iteration}] Quality Score: {score:.2f}")
+            print(f"   [Iteration {iteration}] Quality Score: {score:.2f} | k={k_value}")
         
         return {
             **state,

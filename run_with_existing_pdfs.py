@@ -248,7 +248,8 @@ def main():
                 for entry in score_history:
                     iteration = entry['iteration']
                     score = entry['score']
-                    print(f"   Iteration {iteration}: {score:.2f}/1.0")
+                    k_value = entry.get('k', 'N/A')
+                    print(f"   Iteration {iteration}: {score:.2f}/1.0 (k={k_value})")
                 
                 # Show improvement
                 if len(score_history) > 1:
