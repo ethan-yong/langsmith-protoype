@@ -34,6 +34,7 @@ class RAGState(TypedDict):
     reflection_score: float  # From your LangSmith evaluator (0-1 scale)
     reflection_comment: str  # Detailed feedback from evaluator
     refinement_count: int
+    score_history: List[Dict[str, Any]]  # Track score progression across iterations
     previous_issues: str  # Track what was wrong before refinement
     chat_history: List[dict]
 
@@ -139,8 +140,39 @@ Return ONLY the category name (simple/complex/comparative/synthesis):"""
             search_kwargs={"k": state["retrieval_k"]}
         )
         
-        docs = retriever.get_relevant_documents(state["question"])
+        # #region agent log
+        import json
+        with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"location":"langgraph_rag_agent.py:142","message":"Retriever type and methods","data":{"retriever_type":str(type(retriever)),"has_get_relevant_documents":hasattr(retriever, "get_relevant_documents"),"has_invoke":hasattr(retriever, "invoke"),"available_methods":[m for m in dir(retriever) if not m.startswith('_')]},"timestamp":__import__('time').time()*1000,"sessionId":"debug-session","hypothesisId":"H1-H2"}) + '\n')
+        # #endregion
+        
+        # Use invoke() for newer LangChain versions, fallback to get_relevant_documents()
+        try:
+            # #region agent log
+            with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"location":"langgraph_rag_agent.py:148","message":"Attempting invoke() method","data":{"question":state["question"][:50]},"timestamp":__import__('time').time()*1000,"sessionId":"debug-session","hypothesisId":"H1"}) + '\n')
+            # #endregion
+            
+            docs = retriever.invoke(state["question"])
+            
+            # #region agent log
+            with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"location":"langgraph_rag_agent.py:151","message":"invoke() succeeded","data":{"num_docs":len(docs),"doc_types":[str(type(d)) for d in docs]},"timestamp":__import__('time').time()*1000,"sessionId":"debug-session","hypothesisId":"H1"}) + '\n')
+            # #endregion
+        except AttributeError:
+            # #region agent log
+            with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"location":"langgraph_rag_agent.py:155","message":"invoke() failed, trying get_relevant_documents()","data":{},"timestamp":__import__('time').time()*1000,"sessionId":"debug-session","hypothesisId":"H1-fallback"}) + '\n')
+            # #endregion
+            
+            docs = retriever.get_relevant_documents(state["question"])
+            
         context = "\n\n".join([doc.page_content for doc in docs])
+        
+        # #region agent log
+        with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"location":"langgraph_rag_agent.py:162","message":"Documents retrieved successfully","data":{"num_docs":len(docs),"context_length":len(context)},"timestamp":__import__('time').time()*1000,"sessionId":"debug-session","hypothesisId":"H1"}) + '\n')
+        # #endregion
         
         print(f"   Retrieved {len(docs)} documents")
         
@@ -215,7 +247,7 @@ Answer:""")
             state: Current RAG state
             
         Returns:
-            Updated state with reflection_score and reflection_comment
+            Updated state with reflection_score, reflection_comment, and score_history
         """
         print(f"\n🤔 Reflecting on answer quality...")
         
@@ -248,10 +280,28 @@ Answer:""")
             score = 0.5
             comment = f"Evaluation failed: {str(e)}"
         
+        # Track score history
+        iteration = state.get("refinement_count", 0) + 1
+        score_history = state.get("score_history", [])
+        score_history.append({
+            "iteration": iteration,
+            "score": score,
+            "comment": comment[:100]  # Truncated for history
+        })
+        
+        # Log with comparison (professional text only)
+        if len(score_history) > 1:
+            prev_score = score_history[-2]["score"]
+            improvement = score - prev_score
+            print(f"   [Iteration {iteration}] Quality Score: {score:.2f} (Change: {improvement:+.2f})")
+        else:
+            print(f"   [Iteration {iteration}] Quality Score: {score:.2f}")
+        
         return {
             **state,
             "reflection_score": score,
-            "reflection_comment": comment
+            "reflection_comment": comment,
+            "score_history": score_history
         }
     
     def refine_query_node(self, state: RAGState) -> RAGState:
@@ -395,6 +445,7 @@ Return ONLY the improved query, nothing else:"""
             "reflection_score": 0.0,
             "reflection_comment": "",
             "refinement_count": 0,
+            "score_history": [],
             "previous_issues": "",
             "chat_history": chat_history or []
         }

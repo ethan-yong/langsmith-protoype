@@ -10,6 +10,12 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Fix Windows encoding for emojis (must be first!)
+if sys.platform == 'win32':
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, errors='replace')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, errors='replace')
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -58,6 +64,12 @@ def main():
 
     # Setup Opik tracing (optional)
     opik_client = setup_opik_tracing()
+    
+    # #region agent log
+    import json, time
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:66","message":"Opik setup complete, starting vectorstore load","data":{},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"H4"}) + '\n')
+    # #endregion
 
     # ========================================================================
     # STEP 1: Check if vector store already exists
@@ -65,6 +77,11 @@ def main():
     VECTOR_STORE_PATH = "./faiss_index"
     embedding_manager = EmbeddingManager()
     vectorstore = embedding_manager.load_vector_store(VECTOR_STORE_PATH)
+    
+    # #region agent log
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:73","message":"Vectorstore loaded","data":{"vectorstore_exists":vectorstore is not None},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"H4"}) + '\n')
+    # #endregion
 
     if vectorstore is not None:
         # Vector store exists - skip PDF processing!
@@ -92,10 +109,20 @@ def main():
         vectorstore = embedding_manager.create_vector_store(chunks, VECTOR_STORE_PATH)
 
     # Build or load verbatim PDF index for efficient lookup
+    # #region agent log
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:101","message":"Starting PDF index build","data":{},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"H1"}) + '\n')
+    # #endregion
+    
     pdf_index = PDFSourceIndex(PDF_DIRECTORY, cache_path="./pdf_page_index.json")
     if not pdf_index.load_cache():
         pdf_index.build()
         pdf_index.save_cache()
+    
+    # #region agent log
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:105","message":"PDF index complete","data":{},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"H1"}) + '\n')
+    # #endregion
 
     # ========================================================================
     # STEP 4: Initialize LLaMA QA Agent
@@ -115,6 +142,11 @@ def main():
     print(f"   OPENAI_API_BASE: {api_base}")
     print(f"   LLM_MODEL: {model_name}")
 
+    # #region agent log
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:124","message":"Starting LLaMA agent initialization","data":{"model_name":model_name,"use_remote":use_remote},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"H2"}) + '\n')
+    # #endregion
+    
     qa_agent = LLaMAQAAgent(
         model_name=model_name,
         use_4bit=True,  # Use 4-bit quantization (for local models only)
@@ -122,14 +154,29 @@ def main():
         use_remote=use_remote,
         api_base=api_base
     )
+    
+    # #region agent log
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:131","message":"LLaMA agent initialized","data":{},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"H2"}) + '\n')
+    # #endregion
 
     # Build LangGraph RAG agent instead of simple QA chain
     print("\n🔗 Building LangGraph RAG agent with adaptive retrieval...")
+    
+    # #region agent log
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:134","message":"Starting LangGraph build","data":{},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"H3"}) + '\n')
+    # #endregion
+    
     graph_agent = build_rag_graph(vectorstore, qa_agent.llm)
+    
+    # #region agent log
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:135","message":"LangGraph built successfully","data":{},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"H3"}) + '\n')
+    # #endregion
 
-    # Build verbatim PDF index once for efficient lookup
-    pdf_index = PDFSourceIndex(PDF_DIRECTORY)
-    pdf_index.build()
+    # PDF index already built above (lines 101-105) with caching - no need to rebuild
+    # (Removed duplicate pdf_index.build() that was causing 30+ minute hang)
 
     # ========================================================================
     # STEP 5: Interactive QA Loop with LangGraph
@@ -153,6 +200,11 @@ def main():
     print("   • What are the applications of sentiment analysis?")
     print("   • How is subjectivity handled in sentiment analysis?")
     print()
+    
+    # #region agent log
+    with open(r'c:\Users\EthanYongYuHeng\Desktop\langsmith-protoype\.cursor\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"location":"run_with_existing_pdfs.py:171","message":"Initialization complete, entering interactive loop","data":{},"timestamp":int(time.time()*1000),"sessionId":"debug-session","hypothesisId":"ALL"}) + '\n')
+    # #endregion
 
     while True:
         try:
@@ -184,11 +236,28 @@ def main():
             
             # Display graph execution summary
             print("\n" + "="*60)
-            print("📊 Graph Execution Summary")
+            print("GRAPH EXECUTION SUMMARY")
             print("="*60)
             print(f"Question Type: {result.get('question_type', 'unknown')}")
             print(f"Documents Retrieved: {len(sources)}")
-            print(f"Final Quality Score: {result.get('reflection_score', 0):.2f}/1.0")
+            
+            # Display score progression
+            score_history = result.get('score_history', [])
+            if score_history:
+                print(f"\nSCORE PROGRESSION:")
+                for entry in score_history:
+                    iteration = entry['iteration']
+                    score = entry['score']
+                    print(f"   Iteration {iteration}: {score:.2f}/1.0")
+                
+                # Show improvement
+                if len(score_history) > 1:
+                    first_score = score_history[0]['score']
+                    final_score = score_history[-1]['score']
+                    improvement = final_score - first_score
+                    print(f"   Total Improvement: {improvement:+.2f}")
+            
+            print(f"\nFinal Quality Score: {result.get('reflection_score', 0):.2f}/1.0")
             print(f"Refinements Made: {result.get('refinement_count', 0)}")
             if result.get('refinement_count', 0) > 0:
                 print(f"Evaluator Feedback: {result.get('reflection_comment', '')[:150]}...")

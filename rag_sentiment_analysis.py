@@ -32,10 +32,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
-from langchain.schema import Document
+# Import from langchain_core directly to avoid legacy module issues
+from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
 
 # Transformers for local LLM
 from transformers import (
@@ -538,9 +537,12 @@ class LLaMAQAAgent:
             
             print(f"✅ LLaMA model loaded on {self.device}")
     
-    def create_qa_chain(self, vectorstore: FAISS) -> ConversationalRetrievalChain:
+    def create_qa_chain(self, vectorstore: FAISS):
         """
         Create a conversational retrieval QA chain.
+        
+        LEGACY METHOD: Only used when running rag_sentiment_analysis.py directly.
+        For LangGraph integration, use run_with_existing_pdfs.py instead.
         
         Args:
             vectorstore: FAISS vector store for retrieval
@@ -548,6 +550,10 @@ class LLaMAQAAgent:
         Returns:
             ConversationalRetrievalChain object
         """
+        # Import legacy dependencies only when needed
+        from langchain.chains import ConversationalRetrievalChain
+        from langchain.memory import ConversationBufferMemory
+        
         print("\n🔗 Building conversational QA chain...")
         
         # Create custom prompt template
@@ -639,7 +645,7 @@ Helpful Answer:"""
     )
     def ask_question(
         self,
-        qa_chain: ConversationalRetrievalChain,
+        qa_chain,  # ConversationalRetrievalChain (type hint removed to avoid import)
         question: str
     ) -> Tuple[str, List[Document]]:
         """

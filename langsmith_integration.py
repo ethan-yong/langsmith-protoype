@@ -55,6 +55,87 @@ def _create_judge_llm():
         return None
 
 
+def _parse_answer_for_opik(answer: str, context: str) -> Dict[str, Any]:
+    """
+    Parse an answer text to create structured Opik-compatible trace.
+    
+    Args:
+        answer: The answer text to parse
+        context: The context used to generate the answer
+        
+    Returns:
+        Dictionary with answer_summary, key_points, and concepts_from_context
+    """
+    # Extract summary: first 2-3 sentences
+    sentences = re.split(r'(?<=[.!?])\s+', answer.strip())
+    summary_sentences = sentences[:min(3, len(sentences))]
+    answer_summary = ' '.join(summary_sentences)
+    
+    # Extract key points: look for bullet points, numbered lists, or meaningful sentences
+    key_points = []
+    
+    # First, check for explicit bullet points or numbered lists
+    bullet_pattern = r'(?:^|\n)\s*(?:[-•*]|\d+\.)\s+(.+?)(?=\n|$)'
+    bullets = re.findall(bullet_pattern, answer, re.MULTILINE)
+    
+    if bullets:
+        # Use the bullets/numbered items
+        key_points = [b.strip() for b in bullets[:5]]
+    else:
+        # Extract meaningful sentences (longer than 20 chars, not questions)
+        for sent in sentences:
+            sent = sent.strip()
+            if len(sent) > 20 and not sent.endswith('?'):
+                # Remove common filler starts
+                sent = re.sub(r'^(However|Additionally|Furthermore|Moreover|In addition),?\s*', '', sent)
+                key_points.append(sent)
+                if len(key_points) >= 5:
+                    break
+    
+    # Extract concepts from context: find capitalized terms and technical phrases
+    concepts = []
+    
+    # Common technical terms in the domain
+    common_terms = [
+        'sentiment analysis', 'machine learning', 'natural language processing',
+        'nlp', 'deep learning', 'neural network', 'classification',
+        'feature extraction', 'opinion mining', 'subjectivity', 'polarity',
+        'recurrent neural network', 'rnn', 'lstm', 'transformer',
+        'word embedding', 'word2vec', 'glove', 'bert',
+        'supervised learning', 'unsupervised learning', 'lexicon',
+        'bag of words', 'tf-idf', 'convolutional neural network', 'cnn'
+    ]
+    
+    # Find terms that appear in both answer and context
+    answer_lower = answer.lower()
+    context_lower = context.lower()
+    
+    for term in common_terms:
+        if term in answer_lower and term in context_lower:
+            if term not in concepts:
+                concepts.append(term)
+    
+    # Also extract capitalized phrases (2-4 words) that appear in both
+    cap_pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b'
+    cap_phrases = re.findall(cap_pattern, answer)
+    
+    for phrase in cap_phrases:
+        phrase_lower = phrase.lower()
+        if phrase_lower in context_lower and phrase_lower not in [c.lower() for c in concepts]:
+            concepts.append(phrase)
+            if len(concepts) >= 10:
+                break
+    
+    # Limit to 8 most relevant concepts
+    concepts = concepts[:8]
+    
+    return {
+        "answer_summary": answer_summary,
+        "key_points": key_points[:5],  # Limit to 5 key points
+        "concepts_from_context": concepts
+    }
+
+
 def create_relevance_evaluator() -> Callable:
     """
     Create a relevance evaluator that assesses if the output is relevant to the input.
@@ -172,7 +253,7 @@ IMPORTANT: Respond with ONLY valid JSON. No additional text before or after. The
 
             # Format inputs for the evaluator
             question = inputs.get("question", inputs.get("inputs", ""))
-            answer = outputs.get("answer", outputs.get("outputs", ""))
+            answer = outputs.get("output") or outputs.get("answer") or outputs.get("outputs", "")
             
             # Debug: Print what we're sending
             print(f"🔍 [DEBUG] Relevance evaluator inputs:")
@@ -352,7 +433,7 @@ IMPORTANT: Respond with ONLY valid JSON. No additional text before or after. The
 
             # Format inputs for the evaluator
             question = inputs.get("question", inputs.get("inputs", ""))
-            answer = outputs.get("answer", outputs.get("outputs", ""))
+            answer = outputs.get("output") or outputs.get("answer") or outputs.get("outputs", "")
             
             # Debug: Print what we're sending
             print(f"🔍 [DEBUG] Helpfulness evaluator inputs:")
@@ -826,6 +907,9 @@ def log_and_evaluate_rag_response(
             "evaluation": None,
         }
 
+    # Parse answer for Opik-compatible structured trace
+    opik_trace = _parse_answer_for_opik(answer, context)
+    
     # Create a mock run object for evaluators
     class MockRun:
         def __init__(self, inputs, outputs):
@@ -835,7 +919,10 @@ def log_and_evaluate_rag_response(
 
     mock_run = MockRun(
         inputs={"question": question, "context": context},
-        outputs={"answer": answer}
+        outputs={
+            "output": answer,  # LangSmith-compatible format
+            "opik_trace": opik_trace  # Opik-compatible structured trace
+        }
     )
 
     # Use provided evaluators or default evaluators (cached)
@@ -891,7 +978,9 @@ def log_and_evaluate_rag_response(
             print(f"⚠️  Evaluator {evaluator.__name__ if hasattr(evaluator, '__name__') else 'unknown'} failed: {e}")
 
     payload: Dict[str, Any] = {
-        "answer": answer,
+        "answer": answer,  # Backward compatibility
+        "output": answer,  # LangSmith format
+        "opik_trace": opik_trace,  # Opik structured format
         "evaluation": evaluation_results,
     }
     if all_scores:
